@@ -9,10 +9,10 @@ Update this README every week.
 
 | Field | Value |
 |---|---|
-| Student Name | |
-| GitHub Username | |
-| Project Title | |
-| Chosen AI Approach | |
+| Student Name | Zihao Ying |
+| GitHub Username | foreverprogramming |
+| Project Title | Blockchain Transaction Dashboard |
+| Chosen AI Approach | Fee Stimator |
 
 ## Module Tracking
 
@@ -20,30 +20,25 @@ Use one of these values: `Not started`, `In progress`, `Done`
 
 | Module | What it should include | Status |
 |---|---|---|
-| M1 | Proof of Work Monitor | Not started |
+| M1 | Proof of Work Monitor | In progress |
 | M2 | Block Header Analyzer | Not started |
 | M3 | Difficulty History | Not started |
 | M4 | AI Component | Not started |
 
 ## Current Progress
 
-Write 3 to 5 short lines about what you have already done.
-
-- 
-- 
-- 
-
+- Local repository setted up and connected to GitHub repostitory.
+- Decided the AI approach for M4.
+- Filled the required segments of the README.
+- Made the first commit.
+  
 ## Next Step
 
-Write the next small step you will do before the next class.
-
-- 
+- Make the first API call
 
 ## Main Problem or Blocker
 
-Write here if you are stuck with something.
-
-- 
+- None at the moment.
 
 ## How to Run
 
