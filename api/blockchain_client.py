@@ -191,3 +191,45 @@ def mock_blocks_with_fees(count: int = 60) -> list[dict]:
             },
         })
     return blocks
+
+
+# ── Block transaction IDs (for Merkle proof) ───────────────────────────────
+
+def get_block_txids(block_hash: str) -> list[str]:
+    """Return the list of txids for a block (display/big-endian order)."""
+    return _get(f"{BLOCKSTREAM_URL}/block/{block_hash}/txids").json()
+
+
+def get_transaction(txid: str) -> dict:
+    """Return transaction details from Blockstream."""
+    return _get(f"{BLOCKSTREAM_URL}/tx/{txid}").json()
+
+
+# ── Bitcoin price (for M6 attack cost) ────────────────────────────────────
+
+def get_btc_price_usd() -> float:
+    """Return current BTC/USD price from blockchain.info ticker."""
+    data = _get(f"{BLOCKCHAIN_INFO_URL}/ticker").json()
+    return float(data["USD"]["last"])
+
+
+def get_network_stats() -> dict:
+    """Return aggregated network stats from blockchain.info."""
+    return _get(f"{BLOCKCHAIN_INFO_URL}/stats?format=json").json()
+
+
+# ── Mock extras ────────────────────────────────────────────────────────────
+
+def mock_block_txids(n: int = 50) -> list[str]:
+    """Generate n plausible-looking synthetic txids."""
+    import hashlib
+    ids = []
+    for i in range(n):
+        seed = f"mock_tx_{i}_{MOCK_HEIGHT}".encode()
+        ids.append(hashlib.sha256(seed).hexdigest())
+    return ids
+
+
+def mock_btc_price() -> float:
+    import random
+    return round(random.uniform(58_000, 72_000), 2)

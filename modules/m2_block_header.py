@@ -1,278 +1,212 @@
-"""
-M2 – Block Header Analyzer
-============================
-Displays the 80-byte Bitcoin block header and verifies the Proof of Work
-locally using Python's hashlib, without relying on any external library.
+"""M2 – Block Header Analyzer"""
 
-Bitcoin block header layout (80 bytes, all fields in LITTLE-ENDIAN):
-  ┌─────────────────────────────────────────────────────────────────┐
-  │ Offset │ Size │ Field           │ Description                   │
-  ├────────┼──────┼─────────────────┼───────────────────────────────┤
-  │ 0      │ 4 B  │ Version         │ Block version number          │
-  │ 4      │ 32 B │ Prev block hash │ SHA-256d of previous header   │
-  │ 36     │ 32 B │ Merkle root     │ Root of the transaction tree  │
-  │ 68     │ 4 B  │ Timestamp       │ Unix epoch (seconds)          │
-  │ 72     │ 4 B  │ Bits            │ Compact target encoding       │
-  │ 76     │ 4 B  │ Nonce           │ Miner-controlled counter      │
-  └─────────────────────────────────────────────────────────────────┘
-"""
-
-import hashlib
-import struct
+import hashlib, struct
 from datetime import datetime, timezone
 
+import pandas as pd
 import streamlit as st
 
 from api.blockchain_client import (
-    get_block,
-    get_block_header_hex,
-    get_latest_block,
-    get_tip_hash,
-    mock_latest_block,
+    get_block, get_block_header_hex, get_tip_hash, mock_latest_block,
 )
 
-# ── Cryptographic helpers ───────────────────────────────────────────────────
+PLOTLY_BG = dict(paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)")
 
-def sha256d(data: bytes) -> bytes:
-    """Double SHA-256: SHA256(SHA256(data)). This is Bitcoin's standard hash."""
-    return hashlib.sha256(hashlib.sha256(data).digest()).digest()
+def sha256d(data): return hashlib.sha256(hashlib.sha256(data).digest()).digest()
 
-
-def parse_header(header_hex: str) -> dict:
-    """
-    Parse the 80-byte header from its hex representation.
-
-    Bitcoin stores multi-byte integers in little-endian order.
-    Hashes are stored in their internal byte order (which is reversed
-    compared to the display order used on block explorers).
-    """
-    raw = bytes.fromhex(header_hex)
-    assert len(raw) == 80, f"Expected 80 bytes, got {len(raw)}"
-
-    version    = struct.unpack_from("<I", raw, 0)[0]       # 4 B LE uint32
-    prev_hash  = raw[4:36][::-1].hex()                     # 32 B, reverse for display
-    merkle     = raw[36:68][::-1].hex()                    # 32 B, reverse for display
-    timestamp  = struct.unpack_from("<I", raw, 68)[0]      # 4 B LE uint32
-    bits       = struct.unpack_from("<I", raw, 72)[0]      # 4 B LE uint32
-    nonce      = struct.unpack_from("<I", raw, 76)[0]      # 4 B LE uint32
-
+def parse_header(hex_str):
+    raw = bytes.fromhex(hex_str)
+    assert len(raw) == 80
     return {
-        "version": version,
-        "prev_hash": prev_hash,
-        "merkle_root": merkle,
-        "timestamp": timestamp,
-        "bits": bits,
-        "nonce": nonce,
-        "raw_hex": header_hex,
+        "version":   struct.unpack_from("<I", raw, 0)[0],
+        "prev_hash": raw[4:36][::-1].hex(),
+        "merkle":    raw[36:68][::-1].hex(),
+        "timestamp": struct.unpack_from("<I", raw, 68)[0],
+        "bits":      struct.unpack_from("<I", raw, 72)[0],
+        "nonce":     struct.unpack_from("<I", raw, 76)[0],
+        "raw":       hex_str,
     }
 
+def bits_to_target(bits):
+    return (bits & 0x00FF_FFFF) * (2 ** (8 * ((bits >> 24) - 3)))
 
-def bits_to_target(bits: int) -> int:
-    """Decode compact 'bits' encoding → full 256-bit target integer."""
-    exp = bits >> 24
-    coef = bits & 0x00FF_FFFF
-    return coef * (2 ** (8 * (exp - 3)))
+def verify_pow(hex_str):
+    raw      = bytes.fromhex(hex_str)
+    h_bytes  = sha256d(raw)
+    h_int    = int.from_bytes(h_bytes, "little")
+    bits     = struct.unpack_from("<I", raw, 72)[0]
+    target   = bits_to_target(bits)
+    lz       = 256 - h_int.bit_length() if h_int > 0 else 256
+    return dict(hash_display=h_bytes[::-1].hex(), hash_int=h_int,
+                target=target, passes=h_int <= target, lz_bits=lz)
 
-
-def verify_pow(header_hex: str) -> dict:
-    """
-    Compute SHA256(SHA256(header)) and check it is ≤ target.
-
-    Returns a dict with hash (display order), target, passes, leading_zero_bits.
-    """
-    raw = bytes.fromhex(header_hex)
-    # Double-SHA256 of the 80-byte header
-    hash_bytes_le = sha256d(raw)          # little-endian (internal order)
-    hash_bytes_be = hash_bytes_le[::-1]   # big-endian  (display order, used by explorers)
-    hash_int = int.from_bytes(hash_bytes_le, "little")   # interpret as 256-bit integer
-
-    bits = struct.unpack_from("<I", raw, 72)[0]
-    target = bits_to_target(bits)
-
-    passes = hash_int <= target
-    lz_bits = 256 - hash_int.bit_length() if hash_int > 0 else 256
-
-    return {
-        "hash_display": hash_bytes_be.hex(),   # as shown on block explorers
-        "hash_int": hash_int,
-        "target": target,
-        "passes": passes,
-        "leading_zero_bits": lz_bits,
-    }
+def mock_header_hex(block):
+    v   = block.get("version", 0x20000004)
+    ph  = bytes.fromhex(block.get("previousblockhash", "00"*32))[::-1]
+    mr  = bytes.fromhex(block.get("merkle_root", "00"*32))[::-1]
+    ts  = block.get("timestamp", 0)
+    bi  = block.get("bits", 0x1703A30C)
+    no  = block.get("nonce", 0)
+    return (struct.pack("<I",v) + ph + mr + struct.pack("<I",ts) +
+            struct.pack("<I",bi) + struct.pack("<I",no)).hex()
 
 
-def make_mock_header_hex(block: dict) -> str:
-    """
-    Construct a plausible 80-byte header hex from block metadata.
-    The hash will NOT pass PoW (nonce is arbitrary), but the structure is correct.
-    Used only when the API /header endpoint is unavailable.
-    """
-    version = block.get("version", 0x20000004)
-    prev_raw = bytes.fromhex(block.get("previousblockhash", "00" * 32))[::-1]
-    merkle_raw = bytes.fromhex(block.get("merkle_root", "00" * 32))[::-1]
-    timestamp = block.get("timestamp", 0)
-    bits = block.get("bits", 0x1703A30C)
-    nonce = block.get("nonce", 0)
+def render():
+    # ── Block selector bar ───────────────────────────────────────────────
+    c_inp, c_btn = st.columns([5, 1])
+    with c_inp:
+        bh_input = st.text_input("Block hash (leave empty for latest)",
+                                  placeholder="000000000000000000…", label_visibility="collapsed",
+                                  key="m2_hash_input")
+    with c_btn:
+        go = st.button("Analyze →", key="m2_go")
 
-    header = (
-        struct.pack("<I", version) +
-        prev_raw +
-        merkle_raw +
-        struct.pack("<I", timestamp) +
-        struct.pack("<I", bits) +
-        struct.pack("<I", nonce)
-    )
-    return header.hex()
-
-
-# ── Render ──────────────────────────────────────────────────────────────────
-
-def render() -> None:
-    st.header("🔍 M2 – Block Header Analyzer")
-    st.markdown(
-        "Inspect the 80-byte Bitcoin block header and **verify the Proof of Work "
-        "locally** using `hashlib.sha256`. No external crypto library used."
-    )
-
-    # ── Block selection ───────────────────────────────────────────────────
-    col_a, col_b = st.columns([3, 1])
-    with col_a:
-        block_hash_input = st.text_input(
-            "Block hash (leave empty to use the latest block)",
-            placeholder="000000000000000000…",
-            key="m2_hash_input",
-        )
-    with col_b:
-        lookup = st.button("🔎 Analyze", key="m2_lookup")
-
-    if not lookup:
-        st.info("Enter a block hash or click **Analyze** to load the latest block.")
+    if not go and "m2_parsed" not in st.session_state:
+        st.markdown("""
+        <div style='margin-top:2rem; text-align:center; color:#475569; font-size:.85rem;'>
+            Enter a block hash above or click <strong style='color:#f7931a;'>Analyze →</strong>
+            to load the latest block.
+        </div>""", unsafe_allow_html=True)
         return
 
-    with st.spinner("Fetching block data…"):
-        is_mock = False
-        try:
-            if block_hash_input.strip():
-                bh = block_hash_input.strip()
+    if go or "m2_parsed" not in st.session_state:
+        with st.spinner(""):
+            try:
+                bh = bh_input.strip() or get_tip_hash()
                 block = get_block(bh)
                 header_hex = get_block_header_hex(bh)
-            else:
-                bh = get_tip_hash()
-                block = get_block(bh)
-                header_hex = get_block_header_hex(bh)
-        except Exception as exc:
-            st.warning(f"Live API unavailable ({exc}). Showing demo data.")
-            block = mock_latest_block()
-            header_hex = make_mock_header_hex(block)
-            is_mock = True
+                is_mock = False
+            except Exception as exc:
+                st.warning(f"API unavailable — showing demo data. ({exc})")
+                block = mock_latest_block()
+                header_hex = mock_header_hex(block)
+                is_mock = True
+        st.session_state.update(m2_parsed=parse_header(header_hex),
+                                m2_pow=verify_pow(header_hex),
+                                m2_mock=is_mock)
 
-    if is_mock:
-        st.caption("⚠️ DEMO DATA — constructed locally, PoW will NOT verify (nonce is random).")
+    p   = st.session_state["m2_parsed"]
+    pow = st.session_state["m2_pow"]
+    mock = st.session_state["m2_mock"]
 
-    # ── Parse ─────────────────────────────────────────────────────────────
-    parsed = parse_header(header_hex)
-    pow_result = verify_pow(header_hex)
-    target = pow_result["target"]
-    bits = parsed["bits"]
-    exp_val = bits >> 24
-    coef_val = bits & 0x00FF_FFFF
+    if mock:
+        st.caption("⚠️ DEMO DATA — PoW will not verify (random nonce).")
 
-    st.divider()
-    st.subheader("📦 Block Header Fields (80 bytes)")
+    st.markdown("<hr>", unsafe_allow_html=True)
 
-    header_data = {
-        "Field": [
-            "Version", "Previous Block Hash",
-            "Merkle Root", "Timestamp", "Bits", "Nonce"
-        ],
-        "Bytes": ["4", "32", "32", "4", "4", "4"],
-        "Value": [
-            hex(parsed["version"]),
-            parsed["prev_hash"],
-            parsed["merkle_root"],
-            f"{parsed['timestamp']} → {datetime.fromtimestamp(parsed['timestamp'], tz=timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}",
-            hex(bits),
-            f"{parsed['nonce']:,}",
-        ],
-        "Description": [
-            "Signals which BIP rules this block follows",
-            "SHA-256d of the previous block header (chain link)",
-            "Root of the Merkle tree of all transactions in this block",
-            "Unix epoch (seconds since 1970-01-01 00:00:00 UTC)",
-            f"Compact target: exp={exp_val}, coef={hex(coef_val)}",
-            "32-bit counter varied by miners until hash ≤ target",
-        ],
-    }
-    import pandas as pd
-    df_header = pd.DataFrame(header_data)
-    st.dataframe(df_header, use_container_width=True, hide_index=True)
+    # ── Row 1: 6 header fields ───────────────────────────────────────────
+    st.markdown('<div class="panel-title">80-Byte Block Header Fields</div>',
+                unsafe_allow_html=True)
 
-    # ── Raw header hex ────────────────────────────────────────────────────
-    with st.expander("🗂️ Raw 80-byte header (hex)"):
-        raw_hex = parsed["raw_hex"]
-        annotated = (
-            f"**Version (4 B):** `{raw_hex[0:8]}`  \n"
-            f"**Prev hash (32 B):** `{raw_hex[8:72]}`  \n"
-            f"**Merkle root (32 B):** `{raw_hex[72:136]}`  \n"
-            f"**Timestamp (4 B):** `{raw_hex[136:144]}`  \n"
-            f"**Bits (4 B):** `{raw_hex[144:152]}`  \n"
-            f"**Nonce (4 B):** `{raw_hex[152:160]}`"
-        )
-        st.markdown(annotated)
-        st.code(raw_hex, language=None)
+    dt = datetime.fromtimestamp(p["timestamp"], tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    bits = p["bits"]
+    exp_v, coef_v = bits >> 24, bits & 0x00FFFFFF
+    fields = [
+        ("Version",          "4 B", hex(p["version"]),    "Signals which BIP rules apply"),
+        ("Timestamp",        "4 B", dt,                    f"Unix epoch: {p['timestamp']}"),
+        ("Bits",             "4 B", hex(bits),             f"exp={exp_v}, coef={hex(coef_v)}"),
+        ("Nonce",            "4 B", f"{p['nonce']:,}",     "Miner-controlled counter"),
+    ]
+    c1, c2, c3, c4 = st.columns(4)
+    for col, (label, size, value, desc) in zip([c1,c2,c3,c4], fields):
+        col.markdown(f"""
+        <div class="kpi-card">
+            <div class="kpi-label">{label} <span style='color:#334155;'>({size})</span></div>
+            <div class="kpi-value dim" style='font-size:1rem;'>{value}</div>
+            <div class="kpi-sub">{desc}</div>
+        </div>""", unsafe_allow_html=True)
 
-    st.divider()
-    st.subheader("✅ Proof-of-Work Verification")
-    st.markdown(
-        "**Algorithm:** `SHA256(SHA256(header_bytes))` using Python's `hashlib`. "
-        "The result must be ≤ the target encoded in the `bits` field."
-    )
+    # Long hash fields full-width
+    for label, size, value, desc in [
+        ("Previous Block Hash", "32 B", p["prev_hash"], "SHA-256d of the previous header — the chain link"),
+        ("Merkle Root",         "32 B", p["merkle"],    "Root of the Merkle tree of all transactions"),
+    ]:
+        st.markdown(f"""
+        <div class="kpi-card" style='margin-top:.25rem;'>
+            <div class="kpi-label">{label} <span style='color:#334155;'>({size}) — little-endian stored, reversed for display</span></div>
+            <div style='font-family:"IBM Plex Mono",monospace; font-size:.78rem;
+                        color:#94a3b8; word-break:break-all; margin-top:.3rem;'>{value}</div>
+            <div class="kpi-sub">{desc}</div>
+        </div>""", unsafe_allow_html=True)
 
-    col_code, col_result = st.columns([2, 1])
+    st.markdown("<hr>", unsafe_allow_html=True)
 
-    with col_code:
-        st.code(
-            "import hashlib, struct\n\n"
-            "raw = bytes.fromhex(header_hex)          # 80 bytes\n"
-            "h1  = hashlib.sha256(raw).digest()       # first SHA-256\n"
-            "h2  = hashlib.sha256(h1).digest()        # second SHA-256\n"
-            "# Display order: reverse byte order\n"
-            "hash_display = h2[::-1].hex()\n"
-            "# Numeric comparison is in little-endian\n"
-            "hash_int = int.from_bytes(h2, 'little')\n"
-            "valid = hash_int <= target",
-            language="python",
-        )
+    # ── Row 2: PoW verification ──────────────────────────────────────────
+    left, right = st.columns([1, 1], gap="large")
 
-    with col_result:
-        hash_display = pow_result["hash_display"]
-        passes = pow_result["passes"]
-        lz = pow_result["leading_zero_bits"]
+    with left:
+        st.markdown('<div class="panel-title">Proof-of-Work Verification</div>',
+                    unsafe_allow_html=True)
+        verdict_color = "#22c55e" if pow["passes"] else "#ef4444"
+        verdict_text  = "✓ VALID" if pow["passes"] else "✗ INVALID (demo)"
+        st.markdown(f"""
+        <div style='font-family:"IBM Plex Mono",monospace; font-size:1.3rem;
+                    font-weight:700; color:{verdict_color}; margin-bottom:1rem;'>
+            {verdict_text}
+        </div>""", unsafe_allow_html=True)
 
-        verdict = "🟢 VALID" if passes else "🔴 INVALID (expected for demo)"
-        st.markdown(f"### {verdict}")
-        st.metric("Leading zero bits", f"{lz} / 256")
-        lz_hex = len(hash_display) - len(hash_display.lstrip("0"))
-        st.metric("Leading hex zeros", lz_hex)
+        lz_hex = len(pow["hash_display"]) - len(pow["hash_display"].lstrip("0"))
+        ca, cb = st.columns(2)
+        ca.metric("Leading zero bits", f"{pow['lz_bits']} / 256")
+        cb.metric("Leading hex zeros", lz_hex)
 
-    st.markdown("**Computed hash (SHA256d):**")
-    st.code(hash_display, language=None)
+        st.markdown('<div style="margin-top:.75rem; font-size:.72rem; color:#64748b;">Computed hash (SHA256d):</div>',
+                    unsafe_allow_html=True)
+        st.code(pow["hash_display"], language=None)
+        st.markdown('<div style="font-size:.72rem; color:#64748b;">Target (decoded from bits):</div>',
+                    unsafe_allow_html=True)
+        st.code(f"{pow['target']:064x}", language=None)
 
-    target_hex = f"{target:064x}"
-    st.markdown("**Target (decoded from bits):**")
-    st.code(target_hex, language=None)
+        t_lz = 64 - len(f"{pow['target']:064x}".lstrip("0")) + (64 - len(f"{pow['target']:064x}"))
+        st.markdown(f"""
+        <div style='font-size:.72rem; color:#64748b; margin-top:.5rem;'>
+            hash ≤ target?
+            <strong style='color:{verdict_color};'>{"YES ✓" if pow["passes"] else "NO ✗"}</strong>
+        </div>""", unsafe_allow_html=True)
 
-    # Colour-coded comparison
-    lz_hex_t = len(target_hex) - len(target_hex.lstrip("0"))
-    st.markdown(
-        f"Leading zeros in hash: **{lz_hex}** hex chars | "
-        f"Leading zeros in target: **{lz_hex_t}** hex chars  \n"
-        f"Hash ≤ Target? → **{'YES ✅' if passes else 'NO ❌'}**"
-    )
+    with right:
+        st.markdown('<div class="panel-title">Python Implementation</div>',
+                    unsafe_allow_html=True)
+        st.code("""\
+import hashlib, struct
 
-    st.info(
-        "**Byte-order note:** Bitcoin stores all header fields in little-endian. "
-        "When displaying the hash or previous-block hash on block explorers, "
-        "the bytes are reversed (big-endian display order). "
-        "The PoW comparison is done on the raw little-endian integer."
-    )
+# 80-byte header in little-endian
+raw = bytes.fromhex(header_hex)
+
+# Double SHA-256 (Bitcoin standard)
+h1 = hashlib.sha256(raw).digest()
+h2 = hashlib.sha256(h1).digest()
+
+# Display order: reverse bytes
+hash_display = h2[::-1].hex()
+
+# Numeric comparison: little-endian int
+hash_int = int.from_bytes(h2, 'little')
+
+# Decode bits → target
+exp  = bits >> 24
+coef = bits & 0x00FFFFFF
+target = coef * (2 ** (8 * (exp - 3)))
+
+# PoW check
+valid = hash_int <= target""", language="python")
+
+        st.markdown("""
+        <div style='font-size:.70rem;color:#64748b;margin-top:.6rem;line-height:1.7;'>
+        <strong style='color:#94a3b8;'>Byte order note:</strong> All header fields are
+        stored in <em>little-endian</em>. Hashes are displayed in reversed (big-endian)
+        order on block explorers. The PoW comparison uses the raw little-endian integer.
+        </div>""", unsafe_allow_html=True)
+
+    with st.expander("🗂️  Raw 80-byte header (hex)"):
+        raw = p["raw"]
+        st.markdown(f"""
+        <div style='font-family:"IBM Plex Mono",monospace; font-size:.72rem;
+                    line-height:2.0; color:#64748b;'>
+        <span style='color:#f7931a;'>version  </span> {raw[0:8]}<br>
+        <span style='color:#3b82f6;'>prev     </span> {raw[8:72]}<br>
+        <span style='color:#22c55e;'>merkle   </span> {raw[72:136]}<br>
+        <span style='color:#a855f7;'>timestamp</span> {raw[136:144]}<br>
+        <span style='color:#eab308;'>bits     </span> {raw[144:152]}<br>
+        <span style='color:#ec4899;'>nonce    </span> {raw[152:160]}
+        </div>""", unsafe_allow_html=True)

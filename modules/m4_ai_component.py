@@ -1,342 +1,422 @@
 """
-M4 – AI Component: Transaction Fee Estimator
-==============================================
-Approach chosen: Supervised regression model to predict the optimal
-transaction fee (sat/vByte) from block and mempool features.
+M4 – AI Fee Estimator  (Gradient Boosting Regressor)
+=====================================================
+Predicts optimal transaction fee (sat/vByte) from block-level features.
 
-Pipeline:
-  1. Fetch historical blocks with fee statistics (Mempool.space API).
-  2. Engineer features: hour-of-day, day-of-week, block size, tx count,
-     block fullness ratio, rolling mean fee (lag features).
-  3. Train a Gradient Boosting Regressor (scikit-learn).
-  4. Evaluate with MAE and R² on a held-out test set.
-  5. Show current fee predictions vs Mempool.space recommendations.
+Model choice justification
+--------------------------
+Gradient Boosting was chosen over linear regression, LSTM or Prophet because:
+  • Fees spike non-linearly when blocks are full → tree-based models handle
+    this naturally without manual feature transforms.
+  • Robust to outliers (extreme fee events during congestion).
+  • No feature scaling needed.
+  • Feature importance is interpretable and pedagogically useful.
 
-Why Gradient Boosting?
-  • Handles non-linear relationships (fees spike non-linearly at congestion).
-  • Robust to outliers (fee spikes during bull markets).
-  • No need to scale features.
-  • Interpretable via feature importance.
+Features
+--------
+  hour        – UTC hour of block (captures intra-day demand peaks)
+  day_of_week – weekday (0=Mon) — weekly demand cycles
+  tx_count    – number of confirmed transactions
+  size_mb     – block size in MB
+  fullness    – size_mb / 1.75 (SegWit soft limit)
+  lag_fee     – previous block's median fee (momentum / autocorrelation)
 
-References:
-  • Mempool.space API: https://mempool.space/docs/api
-  • Nakamoto (2008) — Bitcoin: A Peer-to-Peer Electronic Cash System
+Target: median fee rate per block (sat/vByte)
+
+Evaluation metrics
+------------------
+  MAE  – Mean Absolute Error  (primary; same unit as target)
+  RMSE – Root Mean Squared Error (penalises large misses)
+  MAPE – Mean Absolute Percentage Error
+  R²   – Coefficient of determination
+
+Reference: Nakamoto (2008) — §6 on fee incentives.
 """
 
+import math
 from datetime import datetime, timezone
 
 import numpy as np
 import pandas as pd
-import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 from sklearn.ensemble import GradientBoostingRegressor
-from sklearn.metrics import mean_absolute_error, r2_score
-from sklearn.model_selection import train_test_split
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.model_selection import TimeSeriesSplit
 
 from api.blockchain_client import (
-    get_mempool_fees,
-    get_tip_height,
-    get_blocks_with_fees,
-    mock_blocks_with_fees,
-    mock_mempool_fees,
+    get_blocks_with_fees, get_mempool_fees, get_tip_height,
+    mock_blocks_with_fees, mock_mempool_fees,
 )
 
-# ── Feature engineering ─────────────────────────────────────────────────────
+PL = dict(
+    paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+    font=dict(family="IBM Plex Mono, monospace", color="#94a3b8", size=11),
+    margin=dict(t=36, b=36, l=8, r=8),
+    xaxis=dict(gridcolor="#1e2535", linecolor="#1e2535", zeroline=False),
+    yaxis=dict(gridcolor="#1e2535", linecolor="#1e2535", zeroline=False),
+)
 
-def blocks_to_dataframe(blocks: list[dict]) -> pd.DataFrame:
-    """
-    Extract features and target from a list of Mempool.space block dicts.
+FEATURES = ["hour", "day_of_week", "tx_count", "size_mb", "fullness", "lag_fee"]
+TARGET   = "median_fee"
 
-    Features:
-      hour          — UTC hour of block timestamp (captures intra-day demand)
-      day_of_week   — 0=Monday … 6=Sunday (captures weekly demand cycles)
-      tx_count      — number of transactions in the block
-      size_mb       — block size in megabytes
-      fullness      — size_mb / 1.75 (soft limit for SegWit blocks)
-      lag_fee       — previous block's median fee (momentum feature)
+# Fee priority tiers (sat/vByte thresholds)
+TIERS = [("LOW", 0, 10, "#22c55e"), ("MEDIUM", 10, 40, "#eab308"),
+         ("HIGH", 40, 100, "#f97316"), ("PRIORITY", 100, 9999, "#ef4444")]
 
-    Target:
-      median_fee    — median fee rate in sat/vByte
-    """
+
+# ── Data engineering ────────────────────────────────────────────────────────
+
+def to_df(blocks: list[dict]) -> pd.DataFrame:
     rows = []
     for b in blocks:
-        ts = b.get("timestamp", 0)
         extras = b.get("extras", {})
-        median_fee = extras.get("medianFee") or extras.get("avgFeeRate")
-        if median_fee is None:
+        fee = extras.get("medianFee") or extras.get("avgFeeRate")
+        if fee is None:
             continue
-        dt = datetime.fromtimestamp(ts, tz=timezone.utc)
-        size_mb = b.get("size", 1_000_000) / 1_000_000
-        tx_count = b.get("tx_count", 2000)
+        ts   = b.get("timestamp", 0)
+        dt   = datetime.fromtimestamp(ts, tz=timezone.utc)
+        smb  = b.get("size", 1_000_000) / 1_000_000
         rows.append({
-            "height": b.get("height", 0),
-            "timestamp": ts,
-            "hour": dt.hour,
-            "day_of_week": dt.weekday(),
-            "tx_count": tx_count,
-            "size_mb": size_mb,
-            "fullness": min(size_mb / 1.75, 1.0),   # 1.75 MB ≈ typical max block weight/4
-            "median_fee": float(median_fee),
+            "height": b.get("height", 0), "timestamp": ts,
+            "hour": dt.hour, "day_of_week": dt.weekday(),
+            "tx_count": b.get("tx_count", 2000),
+            "size_mb": smb, "fullness": min(smb / 1.75, 1.0),
+            "median_fee": float(fee),
+            "fee_range": extras.get("feeRange", []),
         })
-
     df = pd.DataFrame(rows).sort_values("height").reset_index(drop=True)
-    # Lag feature: previous block median fee
-    df["lag_fee"] = df["median_fee"].shift(1)
-    df = df.dropna()
-    return df
+    df["lag_fee"]   = df["median_fee"].shift(1)
+    df["lag_fee2"]  = df["median_fee"].shift(2)   # second-order lag
+    df["roll_mean"] = df["median_fee"].rolling(5, min_periods=1).mean()
+    return df.dropna(subset=["lag_fee"])
 
 
-FEATURE_COLS = ["hour", "day_of_week", "tx_count", "size_mb", "fullness", "lag_fee"]
-TARGET_COL   = "median_fee"
+def fee_tier(sat_vb: float) -> tuple[str, str]:
+    """Return (tier_name, color) for a given fee rate."""
+    for name, lo, hi, color in TIERS:
+        if lo <= sat_vb < hi:
+            return name, color
+    return "PRIORITY", "#ef4444"
 
 
-def train_model(df: pd.DataFrame):
-    """Train a Gradient Boosting Regressor and return (model, metrics, test_df)."""
-    X = df[FEATURE_COLS]
-    y = df[TARGET_COL]
+def mape(y_true, y_pred) -> float:
+    y_true, y_pred = np.array(y_true), np.array(y_pred)
+    mask = y_true != 0
+    return float(np.mean(np.abs((y_true[mask] - y_pred[mask]) / y_true[mask])) * 100)
 
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.2, shuffle=False  # keep temporal order
+
+# ── Model training ──────────────────────────────────────────────────────────
+
+def train(df: pd.DataFrame):
+    feats = FEATURES + ["lag_fee2", "roll_mean"]
+    df = df.dropna(subset=feats + [TARGET]).reset_index(drop=True)
+    X, y  = df[feats], df[TARGET]
+
+    # ── Time-series cross-validation (3 folds, no shuffle) ──
+    tscv = TimeSeriesSplit(n_splits=3)
+    cv_maes = []
+    for tr_idx, te_idx in tscv.split(X):
+        m = GradientBoostingRegressor(n_estimators=150, learning_rate=0.08,
+                                       max_depth=4, subsample=0.8, random_state=42)
+        m.fit(X.iloc[tr_idx], y.iloc[tr_idx])
+        preds = m.predict(X.iloc[te_idx])
+        cv_maes.append(mean_absolute_error(y.iloc[te_idx], preds))
+
+    # ── Final model on 80 / 20 temporal split ──
+    split = int(len(X) * 0.8)
+    Xtr, Xte = X.iloc[:split], X.iloc[split:]
+    ytr, yte  = y.iloc[:split], y.iloc[split:]
+
+    model = GradientBoostingRegressor(n_estimators=150, learning_rate=0.08,
+                                       max_depth=4, subsample=0.8, random_state=42)
+    model.fit(Xtr, ytr)
+    yp = model.predict(Xte)
+
+    resid = yte.values - yp
+    metrics = dict(
+        mae    = mean_absolute_error(yte, yp),
+        rmse   = math.sqrt(mean_squared_error(yte, yp)),
+        mape   = mape(yte.values, yp),
+        r2     = r2_score(yte, yp),
+        cv_mae = float(np.mean(cv_maes)),
+        cv_std = float(np.std(cv_maes)),
+        n_train=len(Xtr), n_test=len(Xte),
     )
+    test_df = Xte[FEATURES].copy()
+    test_df["actual"], test_df["predicted"], test_df["residual"] = yte.values, yp, resid
 
-    model = GradientBoostingRegressor(
-        n_estimators=150,
-        learning_rate=0.08,
-        max_depth=4,
-        subsample=0.8,
-        random_state=42,
-    )
-    model.fit(X_train, y_train)
-
-    y_pred = model.predict(X_test)
-    metrics = {
-        "mae": mean_absolute_error(y_test, y_pred),
-        "r2": r2_score(y_test, y_pred),
-        "n_train": len(X_train),
-        "n_test": len(X_test),
-    }
-
-    test_df = X_test.copy()
-    test_df["actual"] = y_test.values
-    test_df["predicted"] = y_pred
-
-    return model, metrics, test_df
+    return model, metrics, test_df, feats
 
 
 # ── Render ──────────────────────────────────────────────────────────────────
 
-def render() -> None:
-    st.header("🤖 M4 – AI Fee Estimator")
-    st.markdown(
-        "A **Gradient Boosting** regression model trained on recent block data "
-        "to predict the optimal transaction fee rate (sat/vByte)."
-    )
+def render():
+    c_sl, c_btn = st.columns([4, 1])
+    with c_sl:
+        n_blocks = st.slider("Training blocks", 40, 250, 100, key="m4_n",
+                             label_visibility="collapsed")
+    with c_btn:
+        train_btn = st.button("Train →", key="m4_go")
 
-    with st.expander("ℹ️ Model design & data pipeline", expanded=False):
-        st.markdown(
-            """
-**Why fee estimation?**  
-The Bitcoin mempool operates as a fee-priority queue. Miners select
-transactions that maximise their revenue (sat/vByte × vBytes). Predicting
-the clearing fee rate lets users decide whether to pay a premium for fast
-confirmation or wait for a cheaper slot.
-
-**Model: Gradient Boosting Regressor**  
-| Reason | Detail |
-|---|---|
-| Non-linear relationships | Fees spike non-linearly at full blocks |
-| Outlier robustness | Handles rare fee spikes during congestion events |
-| No feature scaling needed | Tree-based model |
-| Feature importance | Interpretable output |
-
-**Features used:**  
-`hour`, `day_of_week`, `tx_count`, `size_mb`, `fullness`, `lag_fee`
-
-**Target:** median fee rate (sat/vByte) per block  
-**Split:** 80% train / 20% test (temporal, no shuffle)  
-**Evaluation:** MAE (primary) + R²
-            """
-        )
-
-    # ── Data loading ──────────────────────────────────────────────────────
-    col_n, col_btn = st.columns([3, 1])
-    with col_n:
-        n_blocks = st.slider(
-            "Training blocks (recent history)",
-            min_value=30, max_value=200, value=80, key="m4_n_blocks"
-        )
-    with col_btn:
-        train_btn = st.button("🚀 Train model", key="m4_train")
-
-    if "m4_model" not in st.session_state:
-        st.session_state["m4_model"] = None
-
-    if train_btn or st.session_state["m4_model"] is None:
-        with st.spinner("Fetching block data & training model…"):
+    if train_btn or "m4_model" not in st.session_state:
+        with st.spinner("Fetching block data & training…"):
             try:
                 height = get_tip_height()
-                raw_blocks = get_blocks_with_fees(height, count=n_blocks)
-                is_mock = False
+                raw    = get_blocks_with_fees(height, count=n_blocks)
+                mock   = False
             except Exception as exc:
-                st.warning(f"Live API unavailable ({exc}). Using synthetic training data.")
-                raw_blocks = mock_blocks_with_fees(count=n_blocks)
-                is_mock = True
-
+                st.warning(f"API unavailable — synthetic data. ({exc})")
+                raw  = mock_blocks_with_fees(count=n_blocks)
+                mock = True
             try:
-                live_fees = get_mempool_fees()
+                live = get_mempool_fees()
             except Exception:
-                live_fees = mock_mempool_fees()
-                is_mock = True
+                live = mock_mempool_fees(); mock = True
 
-            df = blocks_to_dataframe(raw_blocks)
-            if len(df) < 15:
-                st.error("Not enough data points to train. Try increasing the number of blocks.")
+            df = to_df(raw)
+            if len(df) < 20:
+                st.error("Not enough data — increase block count.")
                 return
+            model, metrics, test_df, feats = train(df)
+            st.session_state.update(
+                m4_model=model, m4_metrics=metrics, m4_test=test_df,
+                m4_df=df, m4_live=live, m4_mock=mock, m4_feats=feats)
 
-            model, metrics, test_df = train_model(df)
-
-            st.session_state["m4_model"] = model
-            st.session_state["m4_metrics"] = metrics
-            st.session_state["m4_test_df"] = test_df
-            st.session_state["m4_df"] = df
-            st.session_state["m4_live_fees"] = live_fees
-            st.session_state["m4_mock"] = is_mock
-
-    if st.session_state["m4_model"] is None:
+    if "m4_model" not in st.session_state:
         return
 
-    model = st.session_state["m4_model"]
-    metrics: dict = st.session_state["m4_metrics"]
-    test_df: pd.DataFrame = st.session_state["m4_test_df"]
-    df: pd.DataFrame = st.session_state["m4_df"]
-    live_fees: dict = st.session_state["m4_live_fees"]
-    is_mock: bool = st.session_state["m4_mock"]
+    model   = st.session_state["m4_model"]
+    metrics = st.session_state["m4_metrics"]
+    test_df = st.session_state["m4_test"]
+    df      = st.session_state["m4_df"]
+    live    = st.session_state["m4_live"]
+    mock    = st.session_state["m4_mock"]
+    feats   = st.session_state["m4_feats"]
 
-    if is_mock:
-        st.caption("⚠️ DEMO DATA — model trained on synthetic fee data.")
+    if mock:
+        st.caption("⚠️  DEMO DATA — synthetic training set.")
 
-    st.divider()
+    st.markdown("<hr>", unsafe_allow_html=True)
 
-    # ── Model performance ─────────────────────────────────────────────────
-    st.subheader("📊 Model Performance")
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("MAE", f"{metrics['mae']:.2f} sat/vByte",
-              help="Mean Absolute Error — average prediction error in sat/vByte")
-    c2.metric("R²", f"{metrics['r2']:.3f}",
-              help="Coefficient of determination (1.0 = perfect)")
-    c3.metric("Training samples", metrics["n_train"])
-    c4.metric("Test samples", metrics["n_test"])
+    # ── KPI row ───────────────────────────────────────────────────────────
+    cols = st.columns(6)
+    kpis = [
+        ("MAE",        f"{metrics['mae']:.2f} sat/vB",   ""),
+        ("RMSE",       f"{metrics['rmse']:.2f} sat/vB",  ""),
+        ("MAPE",       f"{metrics['mape']:.1f}%",         "blue"),
+        ("R²",         f"{metrics['r2']:.3f}",            "blue"),
+        ("CV-MAE",     f"{metrics['cv_mae']:.2f} ± {metrics['cv_std']:.2f}", "dim"),
+        ("Test rows",  str(metrics["n_test"]),             "dim"),
+    ]
+    for col, (label, val, cls) in zip(cols, kpis):
+        col.markdown(f"""<div class="kpi-card">
+            <div class="kpi-label">{label}</div>
+            <div class="kpi-value {cls}">{val}</div>
+        </div>""", unsafe_allow_html=True)
 
-    # Actual vs Predicted scatter
-    fig_pred = px.scatter(
-        test_df, x="actual", y="predicted",
-        title="Actual vs Predicted Fee Rate (test set)",
-        labels={"actual": "Actual (sat/vByte)", "predicted": "Predicted (sat/vByte)"},
-        color_discrete_sequence=["#3b82f6"],
-        opacity=0.7,
-    )
-    max_val = max(test_df["actual"].max(), test_df["predicted"].max()) * 1.05
-    fig_pred.add_trace(go.Scatter(
-        x=[0, max_val], y=[0, max_val],
-        mode="lines", name="Perfect prediction",
-        line=dict(color="#22c55e", dash="dash"),
-    ))
-    fig_pred.update_layout(height=380)
-    st.plotly_chart(fig_pred, use_container_width=True)
+    st.markdown("<hr>", unsafe_allow_html=True)
 
-    st.divider()
+    # ── Charts row 1 ─────────────────────────────────────────────────────
+    l1, r1 = st.columns(2, gap="large")
 
-    # ── Feature importance ────────────────────────────────────────────────
-    st.subheader("🔎 Feature Importance")
-    fi = pd.DataFrame({
-        "Feature": FEATURE_COLS,
-        "Importance": model.feature_importances_,
-    }).sort_values("Importance", ascending=True)
+    with l1:
+        st.markdown('<div class="panel-title">Actual vs Predicted (test set)</div>',
+                    unsafe_allow_html=True)
+        mx = max(test_df["actual"].max(), test_df["predicted"].max()) * 1.05
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(
+            x=test_df["actual"], y=test_df["predicted"], mode="markers",
+            name="Block", marker=dict(color="#3b82f6", size=7, opacity=0.7),
+            hovertemplate="actual %{x:.1f}<br>pred %{y:.1f}<extra></extra>",
+        ))
+        fig.add_trace(go.Scatter(
+            x=[0, mx], y=[0, mx], mode="lines", name="Perfect",
+            line=dict(color="#22c55e", dash="dash", width=1.5),
+        ))
+        fig.update_layout(**PL, height=280, xaxis_title="actual (sat/vB)",
+                          yaxis_title="predicted (sat/vB)",
+                          legend=dict(orientation="h", y=1.08, font=dict(size=10)))
+        st.plotly_chart(fig, use_container_width=True)
 
-    fig_fi = px.bar(
-        fi, x="Importance", y="Feature", orientation="h",
-        title="Gradient Boosting Feature Importances",
-        color="Importance",
-        color_continuous_scale="Blues",
-    )
-    fig_fi.update_layout(height=300, showlegend=False)
-    st.plotly_chart(fig_fi, use_container_width=True)
+    with r1:
+        st.markdown('<div class="panel-title">Residual Distribution</div>',
+                    unsafe_allow_html=True)
+        resid = test_df["residual"].values
+        fig2 = go.Figure()
+        fig2.add_trace(go.Histogram(
+            x=resid, nbinsx=20, name="Residuals",
+            marker_color="#a855f7", opacity=0.8,
+            hovertemplate="error %{x:.1f} sat/vB<extra></extra>",
+        ))
+        # Normal overlay
+        mu, sigma = float(np.mean(resid)), float(np.std(resid))
+        x_n = np.linspace(resid.min()*1.2, resid.max()*1.2, 200)
+        bw  = (resid.max() - resid.min()) / 20
+        pdf = len(resid) * bw * (1/(sigma*(2*math.pi)**0.5)) * np.exp(-0.5*((x_n-mu)/sigma)**2)
+        fig2.add_trace(go.Scatter(
+            x=x_n, y=pdf, mode="lines", name=f"N({mu:.1f}, {sigma:.1f}²)",
+            line=dict(color="#f7931a", width=2, dash="dash"),
+        ))
+        fig2.add_vline(x=0, line_dash="dot", line_color="#22c55e",
+                       annotation_text="zero error", annotation_font=dict(size=9))
+        fig2.update_layout(**PL, height=280, xaxis_title="prediction error (sat/vB)",
+                           yaxis_title="count",
+                           legend=dict(orientation="h", y=1.08, font=dict(size=10)))
+        st.plotly_chart(fig2, use_container_width=True)
 
-    st.divider()
+    # ── Charts row 2 ─────────────────────────────────────────────────────
+    l2, r2 = st.columns(2, gap="large")
 
-    # ── Live fee prediction ───────────────────────────────────────────────
-    st.subheader("💸 Live Fee Prediction")
-    st.markdown("Adjust the current network state to get a fee prediction.")
+    with l2:
+        st.markdown('<div class="panel-title">Feature Importance</div>',
+                    unsafe_allow_html=True)
+        fi = pd.DataFrame({"Feature": feats,
+                           "Importance": model.feature_importances_}).sort_values("Importance")
+        colors = ["#3b82f6"] * (len(fi) - 1) + ["#f7931a"]
+        fig3 = go.Figure(go.Bar(
+            x=fi["Importance"], y=fi["Feature"], orientation="h",
+            marker_color=colors,
+            hovertemplate="%{y}: %{x:.3f}<extra></extra>",
+        ))
+        fig3.update_layout(**PL, height=280, xaxis_title="importance score")
+        st.plotly_chart(fig3, use_container_width=True)
 
-    now_utc = datetime.now(tz=timezone.utc)
+    with r2:
+        st.markdown('<div class="panel-title">Predicted vs Block Index (test set)</div>',
+                    unsafe_allow_html=True)
+        idx = list(range(len(test_df)))
+        fig4 = go.Figure()
+        fig4.add_trace(go.Scatter(
+            x=idx, y=test_df["actual"].tolist(), mode="lines+markers",
+            name="Actual", line=dict(color="#22c55e", width=2),
+            marker=dict(size=5),
+            hovertemplate="block %{x}<br>%{y:.1f} sat/vB<extra></extra>",
+        ))
+        fig4.add_trace(go.Scatter(
+            x=idx, y=test_df["predicted"].tolist(), mode="lines",
+            name="Predicted", line=dict(color="#f7931a", width=2, dash="dot"),
+            hovertemplate="block %{x}<br>%{y:.1f} sat/vB<extra></extra>",
+        ))
+        fig4.update_layout(**PL, height=280, xaxis_title="test block index",
+                           yaxis_title="fee (sat/vB)",
+                           legend=dict(orientation="h", y=1.08, font=dict(size=10)))
+        st.plotly_chart(fig4, use_container_width=True)
 
-    col_a, col_b = st.columns(2)
-    with col_a:
-        pred_hour = st.slider("Hour of day (UTC)", 0, 23, now_utc.hour, key="m4_hour")
-        pred_dow  = st.selectbox("Day of week", ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"],
-                                 index=now_utc.weekday(), key="m4_dow")
-        dow_map = {"Mon":0,"Tue":1,"Wed":2,"Thu":3,"Fri":4,"Sat":5,"Sun":6}
-    with col_b:
+    st.markdown("<hr>", unsafe_allow_html=True)
+
+    # ── Live prediction widget ────────────────────────────────────────────
+    st.markdown('<div class="panel-title">Live Fee Prediction</div>',
+                unsafe_allow_html=True)
+
+    now = datetime.now(tz=timezone.utc)
+    dow_map = {"Mon":0,"Tue":1,"Wed":2,"Thu":3,"Fri":4,"Sat":5,"Sun":6}
+
+    ca, cb, cc = st.columns(3)
+    with ca:
+        pred_hour = st.slider("Hour (UTC)", 0, 23, now.hour, key="m4_hour")
+        pred_dow  = st.selectbox("Day", list(dow_map.keys()),
+                                 index=now.weekday(), key="m4_dow")
+    with cb:
         pred_tx   = st.slider("Expected tx count", 500, 5000, 2500, key="m4_tx")
         pred_full = st.slider("Block fullness %", 0, 100, 85, key="m4_full") / 100
-        pred_lag  = st.slider("Previous block fee (sat/vByte)", 1, 200, 40, key="m4_lag")
+    with cc:
+        pred_lag  = st.slider("Prev block fee (sat/vB)", 1, 200, 40, key="m4_lag")
+        pred_lag2 = st.slider("2nd-prev block fee (sat/vB)", 1, 200, 38, key="m4_lag2")
 
-    pred_size = pred_tx * 450 / 1_000_000   # approximate size from tx count
+    pred_size = pred_tx * 450 / 1_000_000
+    roll_m    = (pred_lag + pred_lag2) / 2  # simplified rolling mean
+    X_new = pd.DataFrame([dict(
+        hour=pred_hour, day_of_week=dow_map[pred_dow],
+        tx_count=pred_tx, size_mb=pred_size, fullness=pred_full,
+        lag_fee=float(pred_lag), lag_fee2=float(pred_lag2), roll_mean=roll_m,
+    )])
+    pred_fee = max(1.0, float(model.predict(X_new)[0]))
+    tier_name, tier_color = fee_tier(pred_fee)
 
-    X_new = pd.DataFrame([{
-        "hour": pred_hour,
-        "day_of_week": dow_map[pred_dow],
-        "tx_count": pred_tx,
-        "size_mb": pred_size,
-        "fullness": pred_full,
-        "lag_fee": float(pred_lag),
-    }])
-    predicted_fee = float(model.predict(X_new)[0])
+    # Comparison cards: model + live tiers
+    fc1, fc2, fc3, fc4, fc5 = st.columns(5)
+    live_cards = [
+        ("🤖 Model", f"{pred_fee:.1f}",                        tier_color, "sat/vByte"),
+        ("Fastest",  str(live.get("fastestFee",  "?")),         "#ef4444",  "sat/vByte"),
+        ("½ Hour",   str(live.get("halfHourFee", "?")),         "#f97316",  "sat/vByte"),
+        ("1 Hour",   str(live.get("hourFee",     "?")),         "#eab308",  "sat/vByte"),
+        ("Economy",  str(live.get("economyFee",  "?")),         "#22c55e",  "sat/vByte"),
+    ]
+    for col, (label, val, color, unit) in zip([fc1,fc2,fc3,fc4,fc5], live_cards):
+        col.markdown(f"""<div class="kpi-card">
+            <div class="kpi-label">{label}</div>
+            <div class="kpi-value" style="color:{color};">{val}</div>
+            <div class="kpi-sub">{unit}</div>
+        </div>""", unsafe_allow_html=True)
 
-    col_pred, col_api = st.columns(2)
-    with col_pred:
-        st.markdown("#### 🤖 Model Prediction")
-        st.metric("Recommended fee", f"{max(1.0, predicted_fee):.1f} sat/vByte")
-    with col_api:
-        st.markdown("#### 📡 Mempool.space Live")
-        st.metric("Fastest fee",    f"{live_fees.get('fastestFee', '?')} sat/vByte")
-        st.metric("½-hour fee",     f"{live_fees.get('halfHourFee', '?')} sat/vByte")
-        st.metric("Economy fee",    f"{live_fees.get('economyFee', '?')} sat/vByte")
+    # Priority tier indicator
+    st.markdown(f"""
+    <div style='margin-top:.75rem; padding:.6rem 1rem; background:#111520;
+                border:1px solid {tier_color}; border-radius:8px; display:inline-block;'>
+        <span style='font-size:.70rem; font-weight:700; letter-spacing:.10em;
+                     text-transform:uppercase; color:#64748b;'>Predicted priority tier</span>
+        <span style='font-family:"IBM Plex Mono",monospace; font-size:1.1rem;
+                     font-weight:700; color:{tier_color}; margin-left:1rem;'>
+            {tier_name}
+        </span>
+    </div>
+    """, unsafe_allow_html=True)
 
-    st.divider()
+    st.markdown("<hr>", unsafe_allow_html=True)
 
-    # ── Historical fee trend ──────────────────────────────────────────────
-    st.subheader("📉 Historical Median Fee Rate (training data)")
-    df_plot = df.copy()
-    df_plot["Date"] = pd.to_datetime(df_plot["timestamp"], unit="s", utc=True)
-    fig_trend = px.line(
-        df_plot, x="Date", y="median_fee",
-        title="Median Fee Rate per Block",
-        labels={"median_fee": "Median fee (sat/vByte)", "Date": ""},
-        color_discrete_sequence=["#a855f7"],
-    )
-    fig_trend.update_layout(height=320)
-    st.plotly_chart(fig_trend, use_container_width=True)
+    # ── Fee tier distribution over training data ──────────────────────────
+    st.markdown('<div class="panel-title">Fee Tier Distribution (training data)</div>',
+                unsafe_allow_html=True)
 
-    with st.expander("📋 Evaluation notes"):
-        st.markdown(
-            f"""
-**MAE = {metrics['mae']:.2f} sat/vByte** — the model's average absolute prediction
-error on the held-out test set. For context, fees typically range from
-1–200 sat/vByte, so an MAE of a few sat/vByte is acceptable for
-priority-tier estimation.
+    la, ra = st.columns(2, gap="large")
+    with la:
+        df_plot = df.copy()
+        df_plot["Date"] = pd.to_datetime(df_plot["timestamp"], unit="s", utc=True)
+        fig5 = go.Figure()
+        # Background tier bands
+        for tname, lo, hi, tc in TIERS:
+            fig5.add_hrect(y0=lo, y1=min(hi, df_plot["median_fee"].max()*1.1),
+                           fillcolor=tc, opacity=0.06, line_width=0,
+                           annotation_text=tname, annotation_position="right",
+                           annotation=dict(font=dict(color=tc, size=9)))
+        fig5.add_trace(go.Scatter(
+            x=df_plot["Date"], y=df_plot["median_fee"], mode="lines",
+            fill="tozeroy", line=dict(color="#a855f7", width=2),
+            fillcolor="rgba(168,85,247,0.08)",
+            hovertemplate="%{x|%b %d %H:%M}<br>%{y:.1f} sat/vB<extra></extra>",
+        ))
+        fig5.update_layout(**PL, height=260, yaxis_title="median fee (sat/vB)")
+        st.plotly_chart(fig5, use_container_width=True)
 
-**R² = {metrics['r2']:.3f}** — explains {'good share of' if metrics['r2'] > 0.5 else 'some of'} the variance
-in fee rates. Low R² on fee data is expected: fee markets are driven by
-real-time mempool dynamics (sudden demand spikes, whale transactions)
-that cannot be predicted from block-level features alone.
+    with ra:
+        counts = {tname: int(((df["median_fee"] >= lo) & (df["median_fee"] < hi)).sum())
+                  for tname, lo, hi, _ in TIERS}
+        fig6 = go.Figure(go.Bar(
+            x=list(counts.keys()), y=list(counts.values()),
+            marker_color=[t[3] for t in TIERS],
+            hovertemplate="%{x}: %{y} blocks<extra></extra>",
+        ))
+        fig6.update_layout(**PL, height=260, yaxis_title="block count",
+                           xaxis_title="fee tier")
+        st.plotly_chart(fig6, use_container_width=True)
 
-**Limitations:**
-- Real-time mempool depth is the strongest predictor but requires a
-  WebSocket connection (future work).
-- Model is retrained on page load — for production, persist the model
-  with `joblib.dump`.
-- Evaluation uses a temporal split (no shuffle) to avoid look-ahead bias.
-            """
-        )
+    with st.expander("ℹ️  Full evaluation notes"):
+        st.markdown(f"""
+**MAE = {metrics['mae']:.2f} sat/vByte** — average absolute prediction error.  
+**RMSE = {metrics['rmse']:.2f}** — heavier penalty on large misses (congestion spikes).  
+**MAPE = {metrics['mape']:.1f}%** — scale-independent; useful when fees span a wide range.  
+**R² = {metrics['r2']:.3f}** — fraction of variance explained by the model.  
+**Cross-validated MAE = {metrics['cv_mae']:.2f} ± {metrics['cv_std']:.2f}** (3-fold TimeSeriesSplit) — gives a more robust estimate than a single train/test split by respecting temporal order.
+
+**Limitations:**  
+- The strongest real-world predictor is current mempool depth (pending tx backlog),  
+  which requires a live WebSocket to mempool.space and is not yet integrated.  
+- The model is trained on block-level data. During sudden demand spikes, the  
+  lag features capture momentum but cannot anticipate the spike onset.  
+- **Temporal split** (no shuffle) is used throughout to prevent look-ahead bias.
+
+**Feature engineering:**  
+Added `lag_fee2` (2-block lag) and `roll_mean` (5-block rolling average) to capture  
+short-term fee autocorrelation beyond the single-lag baseline.
+        """)
