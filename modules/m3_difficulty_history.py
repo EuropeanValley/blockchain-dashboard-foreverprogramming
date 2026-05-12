@@ -126,9 +126,7 @@ def render():
     cl, cr = st.columns([2, 1])
     with cl:
         st.markdown(r"""
-$$\text{new\_difficulty} = \text{old\_difficulty}
-\times \frac{\text{actual time (2016 blocks)}}
-{2016 \times 600\text{ s}}$$
+$$\text{new\_difficulty} = \text{old\_difficulty} \times \dfrac{\text{actual time for 2016 blocks}}{2016 \times 600 \text{ s}}$$
 
 Ratio clamped to **[¼ , 4]** to prevent extreme swings.
         """)

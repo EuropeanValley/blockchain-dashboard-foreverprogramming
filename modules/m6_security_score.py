@@ -270,15 +270,11 @@ def render():
         st.markdown(r"""
 **Nakamoto (2008) §11 formula:**
 
-$$P(z, q) = 1 - \sum_{k=0}^{z}
-    \frac{\lambda^k e^{-\lambda}}{k!}
-    \left(1 - \left(\frac{q}{p}\right)^{z-k+1}\right)$$
+$$P(z, q) = 1 - \sum_{k=0}^{z} \frac{\lambda^k e^{-\lambda}}{k!} \left(1 - \left(\frac{q}{p}\right)^{z-k+1}\right)$$
 
-where $\lambda = z \cdot \frac{q}{p}$,  $p = 1 - q$.
+where $\lambda = z \cdot \frac{q}{p}$, $p = 1 - q$.
 
-The log-scale chart above shows that with **6 confirmations**,
-even an attacker with 30% of hash rate has < 1% success probability.
-At 49%, 6 confirmations still give ~50% — requiring many more.
+The log-scale chart shows that with **6 confirmations**, even an attacker with 30% of hash rate has < 1% success probability. At 49%, 6 confirmations give ~50% — many more are needed.
         """)
 
     st.info(

@@ -104,15 +104,23 @@ def render():
             y=[""],
             orientation="h",
             marker_color=["#ef4444", "#22c55e"],
-            text=[f"  {lz_bits} zero bits — invalid zone",
-                  f"  Valid zone ({(1-frac_zero)*100:.4f}%)"],
-            textposition="inside",
-            textfont=dict(color="white", size=11, family="IBM Plex Mono"),
-            hovertemplate="%{x:.3f}%<extra></extra>",
+            hovertemplate="%{x:.4f}%<extra></extra>",
         ))
-        fig_bar.update_layout(**PLOTLY_LAYOUT, height=90,
+        fig_bar.add_annotation(
+            x=frac_zero * 50, y=0,
+            text=f"{lz_bits} zero bits",
+            showarrow=False, font=dict(color="white", size=11, family="IBM Plex Mono"),
+            xref="x", yref="y",
+        )
+        fig_bar.add_annotation(
+            x=frac_zero * 100 + (1 - frac_zero) * 50, y=0,
+            text="Valid zone",
+            showarrow=False, font=dict(color="white", size=11, family="IBM Plex Mono"),
+            xref="x", yref="y",
+        )
+        fig_bar.update_layout(**PLOTLY_LAYOUT, height=110,
                               xaxis_title="% of 256-bit space")
-        fig_bar.update_layout(margin=dict(t=8, b=28, l=4, r=4))
+        fig_bar.update_layout(margin=dict(t=8, b=40, l=4, r=4))
         fig_bar.update_xaxes(range=[0, 100], showgrid=False)
         fig_bar.update_yaxes(showgrid=False, showticklabels=False)
         st.plotly_chart(fig_bar, use_container_width=True)
