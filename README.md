@@ -1,3 +1,9 @@
+---
+noteId: "16616e004ebf11f1b47d6521b6fe6a69"
+tags: []
+
+---
+
 [![Review Assignment Due Date](https://classroom.github.com/assets/deadline-readme-button-22041afd0340ce965d47ae6ef1cefeee28c7c493a6346c4f15d667ab976d596c.svg)](https://classroom.github.com/a/N3kLi3ZO)
 [![Open in Visual Studio Code](https://classroom.github.com/assets/open-in-vscode-2e0aaae1b6195c2367325f4f02e2d04e9abb55f0b24a779b69b11b9e10269abc.svg)](https://classroom.github.com/online_ide?assignment_repo_id=23659097&assignment_repo_type=AssignmentRepo)
 
@@ -138,3 +144,21 @@ blockchain-dashboard-foreverprogramming/
 - Blockstream API documentation. https://github.com/Blockstream/esplora/blob/master/API.md
 - Mempool.space API documentation. https://mempool.space/docs/api
 - Blockchain.info Charts API. https://www.blockchain.com/explorer/charts
+
+<!-- student-repo-auditor:teacher-feedback:start -->
+## Teacher Feedback
+
+### Kick-off Review
+
+Review time: 2026-05-13 13:30 CEST
+Status: Amber
+
+Strength:
+- Your repository keeps the expected classroom structure.
+
+Improve now:
+- The README is present but still misses part of the required kickoff information.
+
+Next step:
+- Complete the README fields for student information, AI approach, module status, and next step.
+<!-- student-repo-auditor:teacher-feedback:end -->
