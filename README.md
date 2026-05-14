@@ -113,15 +113,17 @@ blockchain-dashboard-foreverprogramming/
 ├── api/
 │   ├── __init__.py
 │   └── blockchain_client.py       ← All API calls + realistic mock fallback data
-└── modules/
-    ├── __init__.py
-    ├── m1_pow_monitor.py           ← PoW Monitor
-    ├── m2_block_header.py          ← Block Header Analyzer
-    ├── m3_difficulty_history.py    ← Difficulty History
-    ├── m4_ai_component.py          ← Fee Estimator (Gradient Boosting)
-    ├── m5_merkle_verifier.py       ← Merkle Proof Verifier
-    ├── m6_security_score.py        ← 51% Attack Cost + Nakamoto §11
-    └── m7_anomaly_detector.py      ← Block Anomaly Detector
+├── modules/
+│   ├── __init__.py
+│   ├── m1_pow_monitor.py           ← PoW Monitor
+│   ├── m2_block_header.py          ← Block Header Analyzer
+│   ├── m3_difficulty_history.py    ← Difficulty History
+│   ├── m4_ai_component.py          ← Fee Estimator (Gradient Boosting)
+│   ├── m5_merkle_verifier.py       ← Merkle Proof Verifier
+│   ├── m6_security_score.py        ← 51% Attack Cost + Nakamoto §11
+│   └── m7_anomaly_detector.py      ← Block Anomaly Detector
+└── report/
+    └── CryptoChain_Report.pdf      ← Final project report
 ```
 
 ## Cryptographic Concepts Applied
